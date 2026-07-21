@@ -3,6 +3,7 @@ import sys
 import os
 import math
 import random
+import hashlib
 from collections import namedtuple, Counter
 
 Config = namedtuple('Config', 'objective bits_mult max_level uncap_pwr w h')
@@ -15,11 +16,19 @@ LVL_COST_SCALE = 1.30
 PWR_ABS_MAX = 20
 SCALE_CONS_WITH_LEVEL = True
 
+# Ledger keys pack each cell's level into 5 bits (see _pack_grid), so no tier may
+# exceed 31. If PWR_ABS_MAX or the GUI's max-tier cap is ever raised past this,
+# widen the packing first.
+assert PWR_ABS_MAX <= 31, "level must fit in 5 bits for ledger keys"
+
 OVR_BASE    = 1.00
 OVR_PER_TIER = 0.20
 
 def ovr_strength(lvl):
     return OVR_BASE + OVR_PER_TIER * (lvl - 1)
+
+# Precomputed ovr_strength by level (index 1..32); avoids ~1M function calls per solve.
+_OVR_STR = [0.0] + [ovr_strength(l) for l in range(1, 33)]
 
 MODULES = {
     'CMP': dict(name='Compiler',     cost=0,   prod={},           cons={}, special='compiler'),
@@ -45,6 +54,86 @@ _CONS_L = {t: [(_RES_IDX[r], a) for r, a in m['cons'].items()] for t, m in MODUL
 
 EPS = 1e-6
 _CACHE_CAP = 200_000
+_EVAL_CAP = 5_000_000          # in-memory guard on the this-run new-entry dict
+_PREFETCH_CAP = 500_000        # rows pulled into RAM per config at run start
+_LEDGER = {}                   # prefetched entries for the current config (canon_key -> value)
+_LEDGER_NEW = {}               # entries discovered this run (canon_key -> value)
+_LEDGER_LOADED = False
+_LEDGER_SIG = None             # config the in-RAM dicts belong to
+_TCODE = {t: i + 1 for i, t in enumerate(MODULES)}
+
+
+# --- symmetry-canonical grid keys --------------------------------------------
+# evaluate() is invariant under the grid's symmetry group (flips / rotations),
+# so we store each layout under the lexicographically smallest of its symmetric
+# encodings. One row then covers 4 (rectangular) to 8 (square) layouts, and the
+# search hits the cache even on a rotation it never literally generated.
+_SYM_CACHE = {}
+
+
+def _symmetries(w, h):
+    got = _SYM_CACHE.get((w, h))
+    if got is not None:
+        return got
+    n = w * h
+    maps = [
+        lambda r, c: (r, c),            # identity
+        lambda r, c: (r, w - 1 - c),    # horizontal flip
+        lambda r, c: (h - 1 - r, c),    # vertical flip
+        lambda r, c: (h - 1 - r, w - 1 - c),  # 180 deg
+    ]
+    if w == h:
+        maps += [
+            lambda r, c: (c, r),                    # transpose
+            lambda r, c: (c, h - 1 - r),            # 90 deg
+            lambda r, c: (h - 1 - c, r),            # 270 deg
+            lambda r, c: (h - 1 - c, w - 1 - r),    # anti-transpose
+        ]
+    perms = []
+    for f in maps:
+        perm = [0] * n
+        for r in range(h):
+            for c in range(w):
+                orr, occ = f(r, c)
+                perm[r * w + c] = orr * w + occ
+        perms.append(perm)
+    _SYM_CACHE[(w, h)] = perms
+    return perms
+
+
+def _pack_grid(grid):
+    # 1 byte per cell: 0 = empty, else (type_code << 5) | level  (level <= 20 < 32)
+    b = bytearray(len(grid))
+    for i, c in enumerate(grid):
+        if c is not None:
+            b[i] = (_TCODE[c[0]] << 5) | (c[1] & 0x1F)
+    return bytes(b)
+
+
+def _canon_key(ctx, grid):
+    # A cell's packed byte depends only on its contents, not its position, so a
+    # symmetry just permutes the base packing. Pack once, then permute bytes --
+    # far cheaper than re-packing the grid 8 times (this is a hot-loop call).
+    base = _pack_grid(grid)
+    best = base  # _symmetries()[0] is the identity
+    for perm in _symmetries(ctx.w, ctx.h)[1:]:
+        k = bytes([base[j] for j in perm])
+        if k < best:
+            best = k
+    return best
+
+
+def _key_hash(ctx, grid):
+    # 8-byte stable digest of the canonical key. The ledger only guides search
+    # (every reported/champion grid is re-scored by evaluate()), so the
+    # astronomically-rare 64-bit collision can at worst nudge a search step --
+    # never corrupt an output -- and it cuts the stored key from ~36 bytes to 8.
+    return hashlib.blake2b(_canon_key(ctx, grid), digest_size=8).digest()
+
+
+def _sig_str(ctx):
+    return '%dx%d|%s|%d|%d' % (ctx.w, ctx.h, repr(round(ctx.mult, 9)),
+                               ctx.max_level, int(ctx.uncap))
 
 INFEASIBLE_PEN = 1e12
 DEFICIT_W = 1e3
@@ -105,7 +194,7 @@ def _neighbor_bonuses(ctx, grid):
             continue
         t, lvl = cell
         if _SPECIAL[t] == 'overclock':
-            s = ovr_strength(lvl)
+            s = _OVR_STR[lvl]
             for n in nb[i]:
                 ovr_adj[n] += s
         for n in nb[i]:
@@ -176,6 +265,21 @@ def cell_bonuses(ctx, grid):
 
 
 def _fast_eval(ctx, grid):
+    if _LEDGER_SIG != _sig_str(ctx):
+        _prefetch_ledger(ctx)
+    lk = _key_hash(ctx, grid)
+    hit = _LEDGER.get(lk)
+    if hit is None:
+        hit = _LEDGER_NEW.get(lk)
+    if hit is not None:
+        return hit
+    res = _fast_eval_raw(ctx, grid)
+    if len(_LEDGER_NEW) < _EVAL_CAP:
+        _LEDGER_NEW[lk] = res
+    return res
+
+
+def _fast_eval_raw(ctx, grid):
     ovr_adj, same_adj = _neighbor_bonuses(ctx, grid)
     corners = ctx.corners
     totals = [0.0, 0.0, 0.0, 0.0]
@@ -315,8 +419,10 @@ def _cell_options(ctx, i):
 
 
 def _cell_contrib(ctx, g, n):
+    # Returns [power, data, memory, bits] contribution of cell n (index-based to
+    # stay off the dict-building hot path; this runs ~1M times per solve).
+    d = [0.0, 0.0, 0.0, 0.0]
     cell = g[n]
-    d = {r: 0.0 for r in RESOURCES}
     if not cell:
         return d
     t, lvl = cell
@@ -330,16 +436,16 @@ def _cell_contrib(ctx, g, n):
         if not o:
             continue
         if _SPECIAL[o[0]] == 'overclock':
-            ovr += ovr_strength(o[1])
+            ovr += _OVR_STR[o[1]]
         if o[0] == t:
             same += 1
     out_mult  = 1 + (LVL_OUT - 1) * (lvl - 1)
     cons_mult = out_mult if SCALE_CONS_WITH_LEVEL else 1.0
     boost = 1.0 + ovr + 0.10 * same
-    for r, amt in MODULES[t]['prod'].items():
-        d[r] += amt * out_mult * boost
-    for r, amt in MODULES[t]['cons'].items():
-        d[r] -= amt * cons_mult
+    for ri, amt in _PROD_L[t]:
+        d[ri] += amt * out_mult * boost
+    for ri, amt in _CONS_L[t]:
+        d[ri] -= amt * cons_mult
     return d
 
 
@@ -365,45 +471,58 @@ def _cell_misplaced(ctx, cell, i):
     return 1 if (cell and _CORNER_ONLY[cell[0]] and i not in ctx.corners) else 0
 
 
-def _scan_cell(ctx, g, i, target):
+def _grid_state(ctx, g):
+    # Full-grid tally as [power, data, memory, bits_raw] (bits NOT multiplied by
+    # ctx.mult), so _scan_cell can carry the running state and skip a fresh
+    # O(n) evaluate() per cell.
+    ev = evaluate(ctx, g); t = ev['totals']
+    totals = [t['power'], t['data'], t['memory'], t['bits'] / ctx.mult]
+    return {'totals': totals, 'cost': ev['cost'],
+            'merges': ev['merges'], 'misplaced': ev['misplaced']}
+
+
+def _scan_cell(ctx, g, i, target, state=None):
+    if state is None:
+        state = _grid_state(ctx, g)
     S = [i] + ctx.nb[i]
-    ev0 = evaluate(ctx, g)
-    bg = {r: ev0['totals'][r] for r in RESOURCES}
-    bg['bits'] /= ctx.mult
+    bg = list(state['totals'])
     for n in S:
         c = _cell_contrib(ctx, g, n)
-        for r in RESOURCES:
-            bg[r] -= c[r]
+        bg[0] -= c[0]; bg[1] -= c[1]; bg[2] -= c[2]; bg[3] -= c[3]
     old = g[i]
-    bg_cost = ev0['cost'] - _cell_cost(old)
-    bg_merges = ev0['merges'] - _cell_merges(old)
-    bg_misplaced = ev0['misplaced'] - _cell_misplaced(ctx, old, i)
+    bg_cost = state['cost'] - _cell_cost(old)
+    bg_merges = state['merges'] - _cell_merges(old)
+    bg_misplaced = state['misplaced'] - _cell_misplaced(ctx, old, i)
 
-    best_opt, best_s = old, None
+    best_opt, best_s, best_state = old, None, None
     for opt in [old] + [o for o in _cell_options(ctx, i) if o != old]:
         g[i] = opt
-        totals = {r: bg[r] for r in RESOURCES}
+        tot = list(bg)
         for n in S:
             c = _cell_contrib(ctx, g, n)
-            for r in RESOURCES:
-                totals[r] += c[r]
-        totals['bits'] *= ctx.mult
+            tot[0] += c[0]; tot[1] += c[1]; tot[2] += c[2]; tot[3] += c[3]
         cost = bg_cost + _cell_cost(opt)
         merges = bg_merges + _cell_merges(opt)
-        obj = merges if ctx.objective == 'merges' else cost
         misplaced = bg_misplaced + _cell_misplaced(ctx, opt, i)
-        feasible = misplaced == 0 and all(totals[r] >= -EPS for r in BALANCE)
+        bits = tot[3] * ctx.mult
+        obj = merges if ctx.objective == 'merges' else cost
+        feasible = misplaced == 0 and tot[0] >= -EPS and tot[1] >= -EPS and tot[2] >= -EPS
         if not feasible:
-            deficit = sum(-totals[r] for r in BALANCE if totals[r] < 0)
+            deficit = 0.0
+            if tot[0] < 0: deficit -= tot[0]
+            if tot[1] < 0: deficit -= tot[1]
+            if tot[2] < 0: deficit -= tot[2]
             s = INFEASIBLE_PEN + deficit * DEFICIT_W + obj
-        elif totals['bits'] < target - EPS:
-            s = BELOW_TARGET_PEN + (target - totals['bits']) * SHORTFALL_W + obj
+        elif bits < target - EPS:
+            s = BELOW_TARGET_PEN + (target - bits) * SHORTFALL_W + obj
         else:
             s = obj
         if best_s is None or s < best_s - 1e-9:
             best_s, best_opt = s, opt
+            best_state = {'totals': list(tot), 'cost': cost,
+                          'merges': merges, 'misplaced': misplaced}
     g[i] = old
-    return best_opt, best_s
+    return best_opt, best_s, best_state
 
 
 def polish(ctx, grid, target):
@@ -412,12 +531,14 @@ def polish(ctx, grid, target):
     improved = True
     while improved:
         improved = False
+        state = _grid_state(ctx, g)
         for i in range(n):
             if g[i] and g[i][0] == 'CMP':
                 continue
-            best_opt, _ = _scan_cell(ctx, g, i, target)
+            best_opt, _, best_state = _scan_cell(ctx, g, i, target, state)
             if best_opt != g[i]:
                 g[i] = best_opt
+                state = best_state
                 improved = True
         ci = next((k for k in range(n) if g[k] and g[k][0] == 'CMP'), None)
         if ci is not None:
@@ -467,21 +588,37 @@ def _crossover(ctx, a, b, rng):
     return child
 
 
-def memetic(ctx, target, base_seed=1234, pop_size=24, gens=400, iters=3000, incumbent=None):
+def memetic(ctx, target, base_seed=1234, pop_size=24, gens=400, iters=3000, incumbent=None,
+            incumbents=None, deadline=None, stop_ev=None):
+    import time as _time
+    def _stop():
+        return ((stop_ev is not None and stop_ev.is_set())
+                or (deadline is not None and _time.time() >= deadline))
     rng = random.Random(base_seed)
     n = ctx.n
     corners = sorted(ctx.corners)
     pop = []
+    seeds = list(incumbents) if incumbents else []
     if incumbent is not None:
-        g = polish(ctx, list(incumbent), target)
+        seeds.append(incumbent)
+    for inc in seeds:
+        if not inc or len(inc) != n:
+            continue
+        g = polish(ctx, list(inc), target)
         pop.append((score(ctx, g, target)[0], g))
     for r in range(pop_size):
+        if _stop() and pop:
+            break
         s = [random_cell(ctx, rng, k) for k in range(n)]
         s[corners[r] if r < len(corners) else rng.randrange(n)] = ('CMP', 1)
         g = polish(ctx, anneal(ctx, target, s, rng, iters=iters)[0], target)
         pop.append((score(ctx, g, target)[0], g))
     pop.sort(key=lambda x: x[0])
+    if len(pop) > pop_size:
+        pop = pop[:pop_size]
     for _ in range(gens):
+        if _stop():
+            break
         pa = min(rng.sample(pop, 3), key=lambda x: x[0])[1]
         pb = min(rng.sample(pop, 3), key=lambda x: x[0])[1]
         child = polish(ctx, _perturb(ctx, _crossover(ctx, pa, pb, rng), rng, rng.choice([0, 1, 2])), target)
@@ -493,14 +630,27 @@ def memetic(ctx, target, base_seed=1234, pop_size=24, gens=400, iters=3000, incu
 
 
 def optimize(ctx, target, restarts=150, iters=6000, base_seed=1234, incumbent=None,
-             ils_iters=400, t0=8000.0):
+             ils_iters=400, t0=8000.0, incumbents=None, deadline=None, stop_event=None):
+    import time as _time
+    def _stop():
+        return ((stop_event is not None and stop_event.is_set())
+                or (deadline is not None and _time.time() >= deadline))
     n = ctx.n
     best, best_s = None, float('inf')
+    seeds = list(incumbents) if incumbents else []
     if incumbent is not None:
-        g = polish(ctx, list(incumbent), target)
-        best, best_s = g, score(ctx, g, target)[0]
+        seeds.append(incumbent)
+    for inc in seeds:
+        if not inc or len(inc) != n:
+            continue
+        g = polish(ctx, list(inc), target)
+        s = score(ctx, g, target)[0]
+        if s < best_s:
+            best, best_s = g, s
     corners = sorted(ctx.corners)
     for r in range(restarts):
+        if _stop():
+            break
         rng = random.Random(base_seed + r * 7919)
         seed = [random_cell(ctx, rng, i) for i in range(n)]
         cpos = corners[r] if r < len(corners) else rng.randrange(n)
@@ -513,6 +663,8 @@ def optimize(ctx, target, restarts=150, iters=6000, base_seed=1234, incumbent=No
         rng = random.Random(base_seed + 990331)
         cur, cur_s = best, best_s
         for _ in range(ils_iters):
+            if _stop():
+                break
             cand = polish(ctx, _perturb(ctx, cur, rng, rng.choice([2, 3, 4, 5])), target)
             cs, _ = score(ctx, cand, target)
             if cs < best_s:
@@ -717,8 +869,18 @@ def report(ctx, grid, target):
     print("=" * 60 + "\n")
 
 
-_SAVED = {'target': 1220.0, 'w': 6, 'h': 6, 'mult': 1.6, 'maxlvl': 10, 'time_limit': 180, 'uncap_pwr': False}
+_SAVED = {'target': 1220.0, 'w': 6, 'h': 6, 'mult': 1.6, 'maxlvl': 10, 'time_limit': 180,
+          'uncap_pwr': False, 'objective': 'merges'}
 _CHAMPIONS = {}
+_RUNS = {}
+
+
+def _ortools_available():
+    try:
+        from ortools.sat.python import cp_model  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 def _cpsat_optimize(ctx, target, time_limit, hint=None, stop_event=None):
@@ -804,45 +966,82 @@ def _cpsat_optimize(ctx, target, time_limit, hint=None, stop_event=None):
                   for i in range(N) for s, v in x[i].items() if isinstance(s, tuple))
     mdl.Minimize(obj)
 
-    if hint is not None:
+    can_clear = hasattr(mdl, 'ClearHints')
+    _hinted = [False]
+
+    def apply_hint(h):
+        if h is None or (_hinted[0] and not can_clear):
+            return
+        if can_clear:
+            mdl.ClearHints()
         for i in range(N):
-            cell = hint[i]
+            cell = h[i]
             st = 'E' if not cell else ('C' if _SPECIAL[cell[0]] == 'compiler' else cell)
             if st in x[i]:
                 mdl.AddHint(x[i][st], 1)
+        _hinted[0] = True
+
+    def extract():
+        grid = [None] * N
+        for i in range(N):
+            for s, v in x[i].items():
+                if solver.Value(v):
+                    grid[i] = ('CMP', 1) if s == 'C' else (None if s == 'E' else s)
+        return grid
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = float(time_limit)
     solver.parameters.num_search_workers = _work_cores()
-    if stop_event is not None:
-        class _Stopper(cp_model.CpSolverSolutionCallback):
-            def on_solution_callback(self):
-                if stop_event.is_set():
-                    self.StopSearch()
+
+    class _Stopper(cp_model.CpSolverSolutionCallback):
+        def on_solution_callback(self):
+            if stop_event is not None and stop_event.is_set():
+                self.StopSearch()
+
+    # CP-SAT's solution callback only fires on *new* solutions, so a plain
+    # Solve() ignores a stop request during the (often long) optimality-proving
+    # tail. Slice the budget into short chunks, warm-starting each from the best
+    # solution found, so Stop is honored within one slice.
+    import time as _t
+    end = _t.time() + float(time_limit)
+    SLICE = 2.5
+    best = hint
+    found = False
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            break
+        remaining = end - _t.time()
+        if remaining <= 1e-3:
+            break
+        apply_hint(best)
+        solver.parameters.max_time_in_seconds = min(SLICE, remaining)
         status = solver.Solve(mdl, _Stopper())
-    else:
-        status = solver.Solve(mdl)
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return None
-    grid = [None] * N
-    for i in range(N):
-        for s, v in x[i].items():
-            if solver.Value(v):
-                grid[i] = ('CMP', 1) if s == 'C' else (None if s == 'E' else s)
-    return grid
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            best = extract(); found = True
+            if status == cp_model.OPTIMAL:
+                break                      # proven optimal -- nothing more to gain
+        elif status == cp_model.INFEASIBLE:
+            break                          # no solution exists; further slices won't help
+    return best if found else None
 
 
 def _worker(p):
+    global _LEDGER_NEW
+    _LEDGER_NEW = {}
     ctx = Ctx(p['cfg'])
+    _prefetch_ledger(ctx)
     gens = max(80, p['restarts'] * 6)
     grid = memetic(ctx, p['target'], base_seed=p['seed'], pop_size=24,
-                   gens=gens, iters=p['iters'])
-    return (score(ctx, grid, p['target'])[0], grid)
+                   gens=gens, iters=p['iters'], incumbents=p.get('incumbents'),
+                   deadline=p.get('deadline'), stop_ev=p.get('stop_ev'))
+    return (score(ctx, grid, p['target'])[0], grid, _LEDGER_NEW)
 
 
-def optimize_parallel(ctx, cfg, target, restarts, iters):
+def optimize_parallel(ctx, cfg, target, restarts, iters, incumbents=None, seed_off=0,
+                      deadline=None, stop_event=None):
     if getattr(sys, 'frozen', False):
-        return optimize(ctx, target, restarts=min(restarts, 8), iters=iters)
+        return optimize(ctx, target, restarts=min(restarts, 8), iters=iters,
+                        base_seed=1234 + seed_off, incumbents=incumbents,
+                        deadline=deadline, stop_event=stop_event)
     try:
         import multiprocessing as mp
         ncores = _work_cores()
@@ -850,45 +1049,99 @@ def optimize_parallel(ctx, cfg, target, restarts, iters):
         ncores = 1
     ncores = max(1, min(ncores, max(1, restarts)))
     if ncores == 1:
-        return optimize(ctx, target, restarts=restarts, iters=iters)
+        return optimize(ctx, target, restarts=restarts, iters=iters,
+                        base_seed=1234 + seed_off, incumbents=incumbents,
+                        deadline=deadline, stop_event=stop_event)
     base, extra = divmod(restarts, ncores)
+    mpctx = mp.get_context('spawn')
+    mgr = mp_stop = None
+    try:
+        if stop_event is not None:
+            mgr = mpctx.Manager()
+            mp_stop = mgr.Event()
+    except Exception:
+        mgr = mp_stop = None
     payloads = []
     for k in range(ncores):
         rs = base + (1 if k < extra else 0)
         if rs <= 0:
             continue
         payloads.append(dict(target=target, cfg=cfg,
-                             restarts=rs, iters=iters, seed=1234 + k * 100003))
+                             restarts=rs, iters=iters, seed=1234 + seed_off + k * 100003,
+                             incumbents=incumbents, deadline=deadline, stop_ev=mp_stop))
+    bridge = {'run': True}
+    watcher = None
     try:
-        mpctx = mp.get_context('spawn')
+        if stop_event is not None and mp_stop is not None:
+            import threading, time as _t
+            def _bridge():
+                while bridge['run']:
+                    if stop_event.is_set():
+                        mp_stop.set(); return
+                    _t.sleep(0.1)
+            watcher = threading.Thread(target=_bridge, daemon=True)
+            watcher.start()
         with mpctx.Pool(len(payloads)) as pool:
             results = [r for r in pool.map(_worker, payloads) if r]
         if not results:
-            return optimize(ctx, target, restarts=restarts, iters=iters)
+            return optimize(ctx, target, restarts=restarts, iters=iters,
+                            base_seed=1234 + seed_off, incumbents=incumbents,
+                            deadline=deadline, stop_event=stop_event)
+        for r in results:
+            if len(r) > 2 and r[2]:
+                _LEDGER_NEW.update(r[2])
         return min(results, key=lambda r: r[0])[1]
     except Exception:
-        return optimize(ctx, target, restarts=restarts, iters=iters)
+        return optimize(ctx, target, restarts=restarts, iters=iters,
+                        base_seed=1234 + seed_off, incumbents=incumbents,
+                        deadline=deadline, stop_event=stop_event)
+    finally:
+        bridge['run'] = False
+        if mgr is not None:
+            try:
+                mgr.shutdown()
+            except Exception:
+                pass
 
 
-def solve_engine(ctx, cfg, target, time_limit, prior=None, stop_event=None):
+def solve_engine(ctx, cfg, target, time_limit, priors=None, stop_event=None, seed_off=0,
+                 progress=None):
     import time as _time
     start = _time.time()
+    deadline = start + time_limit
+    priors = [g for g in (priors or []) if g is not None]
+    obj = ctx.objective                      # 'merges' or 'cost' -- both keys in evaluate()
     def rank(g):
         ev = evaluate(ctx, g)
         feasible = ev['feasible'] and ev['bits'] >= target - EPS
-        return (0 if feasible else 1, ev['merges'])
+        return (0 if feasible else 1, ev[obj])
     def stopped():
-        return stop_event is not None and stop_event.is_set()
-    pool = [g for g in (optimize_parallel(ctx, cfg, target, 48, 3000), prior) if g is not None]
+        return (stop_event is not None and stop_event.is_set()) or _time.time() >= deadline
+    def report(g):
+        if progress is not None and g is not None:
+            try:
+                progress(g)
+            except Exception:
+                pass
+    par = optimize_parallel(ctx, cfg, target, 48, 3000, incumbents=priors, seed_off=seed_off,
+                            deadline=deadline, stop_event=stop_event)
+    pool = [g for g in ([par] + priors) if g is not None]
     best = min(pool, key=rank) if pool else None
+    report(best)
     if not stopped():
-        cp = _cpsat_optimize(ctx, target, time_limit, hint=best, stop_event=stop_event)
+        # give CP-SAT only the time that's actually left, so the total run
+        # honors the requested limit instead of spending it twice.
+        remaining = max(1.0, deadline - _time.time())
+        cp = _cpsat_optimize(ctx, target, remaining, hint=best, stop_event=stop_event)
         if cp is not None and (best is None or rank(cp) < rank(best)):
-            best = cp
-    while (_time.time() - start) < time_limit and not stopped():
-        cand = optimize(ctx, target, restarts=6, iters=3000, incumbent=best)
+            best = cp; report(best)
+    it = 0
+    while not stopped():
+        cand = optimize(ctx, target, restarts=6, iters=3000, base_seed=1234 + seed_off + it * 7789,
+                        incumbent=best, incumbents=priors, deadline=deadline, stop_event=stop_event)
         if best is None or rank(cand) < rank(best):
-            best = cand
+            best = cand; report(best)
+        it += 1
     return best
 
 
@@ -904,14 +1157,162 @@ def _state_path():
     return os.path.join(base, 'grid_optimizer_state.txt')
 
 
+def _ledger_path():
+    base = os.path.dirname(sys.executable) if _FROZEN else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, 'grid_optimizer_ledger.db')
+
+
+def _ledger_sig():
+    # Hash of every constant/module fact that _fast_eval depends on. If any of
+    # these change, cached (feasible, bits, merges, deficit) tuples are stale.
+    import hashlib
+    parts = [LVL_OUT, LVL_WEIGHT, LVL_COST_SCALE, PWR_ABS_MAX,
+             int(SCALE_CONS_WITH_LEVEL), OVR_BASE, OVR_PER_TIER]
+    for t in sorted(MODULES):
+        m = MODULES[t]
+        parts.append((t, m['cost'],
+                      tuple(sorted(m.get('prod', {}).items())),
+                      tuple(sorted(m.get('cons', {}).items())),
+                      m.get('special'), bool(m.get('corner_only'))))
+    return hashlib.md5(repr(parts).encode('utf-8')).hexdigest()
+
+
+_LEGACY_CLEANED = False
+_BITS_SCALE = 1000        # bits stored as round(bits * this) so an int varint replaces an 8-byte REAL
+
+
+# Compact archive of scanned grids. Only FEASIBLE grids are persisted -- an
+# infeasible grid is cheap to recompute and rarely revisited across runs, so it
+# stays in the per-run in-memory cache only. Layout choices that shrink the file:
+#   * cfg table maps each config signature to a small int id (no repeated text)
+#   * key is an 8-byte hash of the canonical grid, not the ~36-byte grid itself
+#   * bits is a scaled int; feasible/deficit are implied (True / 0) so no columns
+def _open_db():
+    global _LEGACY_CLEANED
+    try:
+        import sqlite3
+        con = sqlite3.connect(_ledger_path(), timeout=10)
+        con.execute('PRAGMA journal_mode=WAL')
+        con.execute('PRAGMA synchronous=NORMAL')
+        con.execute('CREATE TABLE IF NOT EXISTS cfg(id INTEGER PRIMARY KEY, sig TEXT UNIQUE)')
+        con.execute('CREATE TABLE IF NOT EXISTS grids('
+                    'c INTEGER, k BLOB, bits INTEGER, merges INTEGER, '
+                    'PRIMARY KEY(c, k)) WITHOUT ROWID')
+        con.execute('CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)')
+        want = _ledger_sig()
+        row = con.execute("SELECT v FROM meta WHERE k='scoresig'").fetchone()
+        constants_ok = row is None or row[0] == want
+        if row is None:
+            con.execute("INSERT INTO meta(k, v) VALUES('scoresig', ?)", (want,))
+        elif not constants_ok:                     # scoring constants changed -> stale
+            con.execute('DELETE FROM grids'); con.execute('DELETE FROM cfg')
+            con.execute("UPDATE meta SET v=? WHERE k='scoresig'", (want,))
+        con.commit()
+        _migrate_legacy(con, constants_ok)
+        if not _LEGACY_CLEANED:
+            _LEGACY_CLEANED = True
+            try:                                    # reclaim the old pickle cache, if present
+                os.remove(os.path.splitext(_ledger_path())[0] + '.dat')
+            except Exception:
+                pass
+        return con
+    except Exception:
+        return None
+
+
+def _migrate_legacy(con, constants_ok):
+    # One-time: fold an old-schema `ledger` table into the compact `grids` table,
+    # keeping only feasible rows and re-hashing their keys, then reclaim the space.
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger'").fetchone():
+        return
+    try:
+        if constants_ok:
+            for (sig,) in con.execute('SELECT DISTINCT sig FROM ledger').fetchall():
+                con.execute('INSERT OR IGNORE INTO cfg(sig) VALUES(?)', (sig,))
+                cid = con.execute('SELECT id FROM cfg WHERE sig=?', (sig,)).fetchone()[0]
+                last = b''
+                while True:                          # keyset pagination keeps RAM bounded
+                    page = con.execute(
+                        'SELECT gkey, bits, merges FROM ledger '
+                        'WHERE feasible=1 AND sig=? AND gkey>? ORDER BY gkey LIMIT 50000',
+                        (sig, last)).fetchall()
+                    if not page:
+                        break
+                    con.executemany(
+                        'INSERT OR IGNORE INTO grids(c, k, bits, merges) VALUES(?, ?, ?, ?)',
+                        [(cid, hashlib.blake2b(g, digest_size=8).digest(),
+                          int(round(b * _BITS_SCALE)), int(m)) for g, b, m in page])
+                    last = page[-1][0]
+                    con.commit()
+        con.execute('DROP TABLE ledger')
+        con.commit()
+        con.execute('VACUUM')
+        con.commit()
+    except Exception:
+        pass
+
+
+def _cfg_id(con, sig, create=False):
+    row = con.execute('SELECT id FROM cfg WHERE sig=?', (sig,)).fetchone()
+    if row:
+        return row[0]
+    if not create:
+        return None
+    con.execute('INSERT OR IGNORE INTO cfg(sig) VALUES(?)', (sig,))
+    return con.execute('SELECT id FROM cfg WHERE sig=?', (sig,)).fetchone()[0]
+
+
+def _prefetch_ledger(ctx):
+    # Pull only the current config's rows into RAM; the DB keeps every other
+    # config's rows on disk, untouched.
+    global _LEDGER, _LEDGER_LOADED, _LEDGER_SIG
+    _LEDGER_LOADED = True
+    _LEDGER_SIG = _sig_str(ctx)
+    _LEDGER = {}
+    con = _open_db()
+    if con is None:
+        return
+    try:
+        cid = _cfg_id(con, _LEDGER_SIG)
+        if cid is not None:
+            cur = con.execute('SELECT k, bits, merges FROM grids WHERE c=? LIMIT ?',
+                              (cid, _PREFETCH_CAP))
+            _LEDGER = {k: (True, b / _BITS_SCALE, m, 0.0) for (k, b, m) in cur}
+    except Exception:
+        _LEDGER = {}
+    finally:
+        con.close()
+
+
+def _save_ledger():
+    if not _LEDGER_NEW:
+        return
+    con = _open_db()
+    if con is None:
+        return
+    try:
+        cid = _cfg_id(con, _LEDGER_SIG or '', create=True)
+        rows = [(cid, k, int(round(v[1] * _BITS_SCALE)), int(v[2]))
+                for k, v in _LEDGER_NEW.items() if v[0]]   # v[0] = feasible: skip the rest
+        if rows:
+            con.executemany('INSERT OR IGNORE INTO grids(c, k, bits, merges) '
+                            'VALUES(?, ?, ?, ?)', rows)
+            con.commit()
+    except Exception:
+        pass
+    finally:
+        con.close()
+
+
 def _load_state():
-    global _SAVED, _CHAMPIONS
+    global _SAVED, _CHAMPIONS, _RUNS
     try:
         import ast
         with open(_state_path(), 'r', encoding='utf-8') as f:
             st = ast.literal_eval(f.read())
         _SAVED = st.get('saved', _SAVED)
         _CHAMPIONS = st.get('champions', _CHAMPIONS)
+        _RUNS = st.get('runs', _RUNS)
     except Exception:
         pass
 
@@ -919,7 +1320,7 @@ def _load_state():
 def _persist():
     try:
         with open(_state_path(), 'w', encoding='utf-8') as f:
-            f.write(repr({'saved': _SAVED, 'champions': _CHAMPIONS}))
+            f.write(repr({'saved': _SAVED, 'champions': _CHAMPIONS, 'runs': _RUNS}))
     except Exception:
         pass
 
@@ -930,34 +1331,64 @@ def _save_settings(d):
     _persist()
 
 
+def _next_seed_off(key):
+    global _RUNS
+    n = _RUNS.get(key, 0) + 1
+    r = dict(_RUNS); r[key] = n
+    for k in list(r)[:-40]:
+        del r[k]
+    _RUNS = r
+    _persist()
+    return n * 1_000_003
+
+
 def _champion_key(opts):
     return (f"{opts['target']:g}|{opts['w']}x{opts['h']}|m{opts['mult']:g}"
-            f"|t{opts['maxlvl']}|u{int(opts['uncap_pwr'])}")
+            f"|t{opts['maxlvl']}|u{int(opts['uncap_pwr'])}|o{opts.get('objective', 'merges')}")
 
 
-def _load_champion(key):
-    return _CHAMPIONS.get(key)
+def _as_archive(v):
+    if not v:
+        return []
+    return list(v) if isinstance(v[0], list) else [v]
 
 
-def _best_prior(ctx, target):
-    best = None; best_m = None
-    for grid in _CHAMPIONS.values():
-        if len(grid) != ctx.n:
+def _priors(ctx, target, cap=12):
+    scored = []
+    for v in _CHAMPIONS.values():
+        for grid in _as_archive(v):
+            if len(grid) != ctx.n:
+                continue
+            if any(c and c[0] != 'CMP' and c[1] > ctx.type_max(c[0]) for c in grid):
+                continue
+            ev = evaluate(ctx, grid)
+            if not (ev['feasible'] and ev['bits'] >= target - EPS):
+                continue
+            scored.append((ev[ctx.objective], grid))
+    scored.sort(key=lambda x: x[0])
+    seen = set(); out = []
+    for _, g in scored:
+        k = tuple(g)
+        if k in seen:
             continue
-        if any(c and c[0] != 'CMP' and c[1] > ctx.type_max(c[0]) for c in grid):
-            continue
-        ev = evaluate(ctx, grid)
-        if not (ev['feasible'] and ev['bits'] >= target - EPS):
-            continue
-        if best is None or ev['merges'] < best_m:
-            best_m, best = ev['merges'], grid
-    return best
+        seen.add(k); out.append(g)
+        if len(out) >= cap:
+            break
+    return out
 
 
 def _save_champion(key, grid):
     global _CHAMPIONS
     d = dict(_CHAMPIONS)
-    d[key] = grid
+    arch = _as_archive(d.get(key))
+    arch.append(grid)
+    seen = set(); uniq = []
+    for g in reversed(arch):
+        k = tuple(g)
+        if k in seen:
+            continue
+        seen.add(k); uniq.append(g)
+    d[key] = list(reversed(uniq))[-12:]
     for k in list(d)[:-20]:
         del d[k]
     _CHAMPIONS = d
@@ -965,15 +1396,17 @@ def _save_champion(key, grid):
 
 
 def _parse_time(s):
-    s = str(s).strip().lower()
-    mult = 1.0
-    if s.endswith('min'):
-        s = s[:-3]; mult = 60.0
-    elif s.endswith('m'):
-        s = s[:-1]; mult = 60.0
-    elif s.endswith('s'):
-        s = s[:-1]
-    return float(s) * mult
+    # Accepts bare seconds ("90"), single units ("20m", "1.5h", "45s", "3min"),
+    # and combinations ("1h30m", "1m30s"). Bare numbers are seconds.
+    import re
+    s = str(s).strip().lower().replace('min', 'm').replace(' ', '')
+    if not s:
+        raise ValueError('empty')
+    unit = {'h': 3600.0, 'm': 60.0, 's': 1.0, '': 1.0}
+    tokens = re.findall(r'(\d*\.?\d+)([hms]?)', s)
+    if not tokens or ''.join(n + u for n, u in tokens) != s:
+        return float(s)  # malformed -> let float() raise for the caller to catch
+    return sum(float(n) * unit[u] for n, u in tokens)
 
 
 def run_gui():
@@ -1025,15 +1458,31 @@ def run_gui():
             column=0, row=r, columnspan=3, sticky='w', pady=(2, 0))
         return var
 
+    def combo(label, default, values, hint=''):
+        r = nextrow()
+        _label(r, label)
+        var = tk.StringVar(value=default)
+        ttk.Combobox(frm, textvariable=var, values=values, state='readonly',
+                     width=INPUT_W + 6).grid(column=1, row=r, sticky='w', pady=ROWPAD)
+        _hint(r, hint)
+        return var
+
+    OBJ_LABELS = [('merges', 'Fewest manual merges'), ('cost', 'Lowest token cost')]
+    to_label = dict(OBJ_LABELS)
+    to_obj = {v: k for k, v in OBJ_LABELS}
+
     S = _load_settings()
     tb = int(TARGET_BITS) if TARGET_BITS == int(TARGET_BITS) else TARGET_BITS
     v_target = entry("Target Bits/Sec", S.get('target', tb))
     v_w      = entry("Grid Width", S.get('w', 6))
     v_h      = entry("Grid Height", S.get('h', 6))
     v_time   = entry("Time Limit", S.get('time_str', S.get('time_limit', 180)),
-                     hint="Seconds, or add 'm' for minutes (e.g. 20m). Longer = better.")
+                     hint="Seconds; add m/h or combine (e.g. 20m, 1h30m). Longer = better.")
     v_mult   = entry("Bits Multiplier", S.get('mult', 1.6), hint='Global multiplier on bits output.')
     v_maxlvl = entry("Max Tier", S.get('maxlvl', 10), hint='Deepest tier allowed; lower solves faster.')
+    v_obj    = combo("Optimize For", to_label.get(S.get('objective', 'merges'), OBJ_LABELS[0][1]),
+                     [lbl for _, lbl in OBJ_LABELS],
+                     hint='Fewest merges = easiest to build; lowest cost = cheapest to buy.')
     v_uncap  = check("Uncap Power Supply tier (ignores Max Tier)", S.get('uncap_pwr', False))
 
     run_btn = ttk.Button(frm, text="Run")
@@ -1057,19 +1506,32 @@ def run_gui():
 
     def work(opts):
         try:
-            cfg = Config('merges', opts['mult'], opts['maxlvl'],
+            cfg = Config(opts['objective'], opts['mult'], opts['maxlvl'],
                          opts['uncap_pwr'], opts['w'], opts['h'])
             ctx = Ctx(cfg)
             key = _champion_key(opts)
-            grid = solve_engine(ctx, cfg, opts['target'], opts['time_limit'],
-                                prior=_best_prior(ctx, opts['target']),
-                                stop_event=stop_event)
+            _prefetch_ledger(ctx); _LEDGER_NEW.clear()
+            tgt = opts['target']
+            def on_improve(gr):
+                ev = evaluate(ctx, gr)
+                ok = ev['feasible'] and ev['bits'] >= tgt - EPS
+                metric = (f"{ev['merges']} merges" if opts['objective'] == 'merges'
+                          else f"{ev['cost']:.0f} cost")
+                q.put(('progress', f"Working... best so far: {metric}, {ev['bits']:.0f} bits/s"
+                                   f"{'' if ok else ' (below target)'}"))
+            grid = solve_engine(ctx, cfg, tgt, opts['time_limit'],
+                                priors=_priors(ctx, tgt), stop_event=stop_event,
+                                seed_off=_next_seed_off(key), progress=on_improve)
             _save_champion(key, grid)
+            _save_ledger()
             ev = evaluate(ctx, grid)
-            write_and_open_html(ctx, grid, opts['target'])
-            ok = ev['feasible'] and ev['bits'] >= opts['target'] - EPS
+            write_and_open_html(ctx, grid, tgt)
+            ok = ev['feasible'] and ev['bits'] >= tgt - EPS
+            metric = (f"{ev['merges']} merges" if opts['objective'] == 'merges'
+                      else f"{ev['cost']:.0f} token cost")
+            note = "" if _ortools_available() else " (exact solver off: install 'ortools' for better results)"
             q.put(('done', f"{'Done' if ok else 'Best found (below target)'}: "
-                           f"{ev['bits']:.0f} bits/s, {ev['merges']} merges. Opened in browser."))
+                           f"{ev['bits']:.0f} bits/s, {metric}. Opened in browser.{note}"))
         except Exception as e:
             q.put(('error', f"Error: {e}"))
 
@@ -1079,6 +1541,9 @@ def run_gui():
         except queue.Empty:
             if prog['t0'] is not None:
                 set_progress(min(0.99, (time.time() - prog['t0']) / prog['limit']))
+            root.after(120, poll); return
+        if kind == 'progress':
+            status.config(text=msg, foreground='#555')
             root.after(120, poll); return
         set_progress(1.0 if kind == 'done' else 0.0)
         prog['t0'] = None
@@ -1101,6 +1566,7 @@ def run_gui():
                 time_limit=_parse_time(raw_time),
                 time_str=raw_time.strip(),
                 uncap_pwr=bool(v_uncap.get()),
+                objective=to_obj.get(v_obj.get(), 'merges'),
             )
             assert opts['w'] >= 1 and opts['h'] >= 1 and opts['target'] > 0
             assert opts['mult'] > 0 and 1 <= opts['maxlvl'] <= 20
@@ -1148,32 +1614,51 @@ def _relaunch_windowless():
         return False
 
 
+def _sym_variants(gr, w, h):
+    def at(r, c):
+        return gr[r * w + c]
+    out = [[at(r, w - 1 - c) for r in range(h) for c in range(w)],   # hflip
+           [at(h - 1 - r, c) for r in range(h) for c in range(w)],   # vflip
+           [at(h - 1 - r, w - 1 - c) for r in range(h) for c in range(w)]]  # 180
+    if w == h:
+        out.append([at(c, r) for r in range(h) for c in range(w)])   # transpose
+    return out
+
+
 def _selftest():
     rng = random.Random(0)
-    fast_bad = 0; scan_bad = 0; checks = 0
+    fast_bad = 0; scan_bad = 0; checks = 0; canon_bad = 0; canon_checks = 0
     for (w, h) in [(5, 4), (6, 4), (6, 6)]:
-        ctx = Ctx(Config('merges', 1.6, 8, False, w, h))
-        for _ in range(40):
-            gr = [random_cell(ctx, rng, k) for k in range(ctx.n)]
-            gr[rng.randrange(ctx.n)] = ('CMP', 1)
-            ev = evaluate(ctx, gr); f, b, m, d = _fast_eval(ctx, gr)
-            if f != ev['feasible'] or abs(b - ev['bits']) > 1e-6 or m != ev['merges']:
-                fast_bad += 1
-            for i in range(ctx.n):
-                if gr[i] and gr[i][0] == 'CMP':
-                    continue
-                bs, bo = None, gr[i]
-                for opt in [gr[i]] + [o for o in _cell_options(ctx, i) if o != gr[i]]:
-                    tr = list(gr); tr[i] = opt
-                    s, _ = score(ctx, tr, 800)
-                    if bs is None or s < bs - 1e-9:
-                        bs, bo = s, opt
-                io, _ = _scan_cell(ctx, gr, i, 800); checks += 1
-                if io != bo:
-                    scan_bad += 1
+        for objective in ('merges', 'cost'):
+            ctx = Ctx(Config(objective, 1.6, 8, False, w, h))
+            for _ in range(40):
+                gr = [random_cell(ctx, rng, k) for k in range(ctx.n)]
+                gr[rng.randrange(ctx.n)] = ('CMP', 1)
+                if objective == 'merges':          # objective-independent checks: run once
+                    ev = evaluate(ctx, gr); f, b, m, d = _fast_eval(ctx, gr)
+                    if f != ev['feasible'] or abs(b - ev['bits']) > 1e-6 or m != ev['merges']:
+                        fast_bad += 1
+                    ck = _canon_key(ctx, gr)
+                    for v in _sym_variants(gr, w, h):
+                        canon_checks += 1
+                        if _canon_key(ctx, v) != ck:
+                            canon_bad += 1
+                for i in range(ctx.n):
+                    if gr[i] and gr[i][0] == 'CMP':
+                        continue
+                    bs, bo = None, gr[i]
+                    for opt in [gr[i]] + [o for o in _cell_options(ctx, i) if o != gr[i]]:
+                        tr = list(gr); tr[i] = opt
+                        s, _ = score(ctx, tr, 800)
+                        if bs is None or s < bs - 1e-9:
+                            bs, bo = s, opt
+                    io, _, _ = _scan_cell(ctx, gr, i, 800); checks += 1
+                    if io != bo:
+                        scan_bad += 1
     print(f"_fast_eval vs evaluate mismatches: {fast_bad}")
-    print(f"_scan_cell vs score mismatches: {scan_bad}/{checks}")
-    ok = fast_bad == 0 and scan_bad == 0
+    print(f"_scan_cell vs score mismatches (merges+cost): {scan_bad}/{checks}")
+    print(f"canon-key symmetry mismatches: {canon_bad}/{canon_checks}")
+    ok = fast_bad == 0 and scan_bad == 0 and canon_bad == 0
     print("PASS" if ok else "FAIL")
     return ok
 
