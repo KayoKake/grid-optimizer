@@ -6,7 +6,7 @@ best layout to an HTML page that mirrors the in-game grid.
 
 ## Run
 
-- **Windows:** double-click `Grid Optimizer.pyw` (opens a small GUI, no console window).
+- **Windows:** double-click `Grid Optimizer.pyw`.
 - **Any OS:** `python "Grid Optimizer.pyw"`
 
 Requires **Python 3.8+**.
@@ -17,7 +17,7 @@ For the best results, also install OR-Tools (the exact CP-SAT solver):
 pip install ortools
 ```
 
-Without OR-Tools it still runs, but uses a heuristic only (slightly worse layouts).
+Without OR-Tools it still runs, but uses a heuristic only (worse layouts).
 
 ## How it works
 
