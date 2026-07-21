@@ -25,14 +25,3 @@ Set the target bits/sec, grid size, bits multiplier, max tier, and a time limit,
 then Run. It warm-starts a heuristic (simulated annealing + local search + a
 memetic population), feeds that into the CP-SAT exact solver, and keeps the best
 of the two plus any previous champion — so a rerun never comes back worse.
-
-## Build a standalone .exe (optional)
-
-```
-pip install pyinstaller ortools
-pyinstaller --onefile --windowed --collect-all ortools ^
-  --exclude-module pandas --exclude-module matplotlib --exclude-module scipy ^
-  "Grid Optimizer.pyw"
-```
-
-Produces `dist/Grid Optimizer.exe` (~44 MB, self-contained, no install needed).
