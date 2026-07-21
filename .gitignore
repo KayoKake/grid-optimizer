@@ -7,6 +7,5 @@ dist/
 __pycache__/
 *.pyc
 
-# Runtime output / local state
+# Runtime output
 grid_layout.html
-grid_optimizer_state.txt

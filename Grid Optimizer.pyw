@@ -52,6 +52,10 @@ BELOW_TARGET_PEN = 1e8
 SHORTFALL_W = 1e4
 
 
+def _work_cores():
+    return max(1, (os.cpu_count() or 2) - 2)
+
+
 def corner_set(w, h):
     return {0, w - 1, (h - 1) * w, w * h - 1}
 
@@ -809,7 +813,7 @@ def _cpsat_optimize(ctx, target, time_limit, hint=None, stop_event=None):
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
-    solver.parameters.num_search_workers = max(1, os.cpu_count() or 1)
+    solver.parameters.num_search_workers = _work_cores()
     if stop_event is not None:
         class _Stopper(cp_model.CpSolverSolutionCallback):
             def on_solution_callback(self):
@@ -841,7 +845,7 @@ def optimize_parallel(ctx, cfg, target, restarts, iters):
         return optimize(ctx, target, restarts=min(restarts, 8), iters=iters)
     try:
         import multiprocessing as mp
-        ncores = os.cpu_count() or 1
+        ncores = _work_cores()
     except Exception:
         ncores = 1
     ncores = max(1, min(ncores, max(1, restarts)))
@@ -912,29 +916,12 @@ def _load_state():
         pass
 
 
-def _rewrite_self(name, value):
+def _persist():
     try:
-        import re
-        path = os.path.abspath(__file__)
-        with open(path, 'r', encoding='utf-8') as f:
-            text = f.read()
-        new = re.sub(r'(?m)^%s = .*$' % name, '%s = %r' % (name, value), text, count=1)
-        with open(path, 'w', encoding='utf-8', newline='') as f:
-            f.write(new)
+        with open(_state_path(), 'w', encoding='utf-8') as f:
+            f.write(repr({'saved': _SAVED, 'champions': _CHAMPIONS}))
     except Exception:
         pass
-
-
-def _persist():
-    if _FROZEN:
-        try:
-            with open(_state_path(), 'w', encoding='utf-8') as f:
-                f.write(repr({'saved': _SAVED, 'champions': _CHAMPIONS}))
-        except Exception:
-            pass
-    else:
-        _rewrite_self('_SAVED', _SAVED)
-        _rewrite_self('_CHAMPIONS', _CHAMPIONS)
 
 
 def _save_settings(d):
@@ -1192,8 +1179,7 @@ def _selftest():
 
 
 def main():
-    if _FROZEN:
-        _load_state()
+    _load_state()
     if len(sys.argv) >= 2 and sys.argv[1] == '--selftest':
         sys.exit(0 if _selftest() else 1)
     if len(sys.argv) >= 2 and sys.argv[1] == '--partest':
