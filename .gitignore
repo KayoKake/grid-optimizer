@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime output / local state
+grid_layout.html
+grid_optimizer_state.txt
