@@ -46,7 +46,6 @@ _CONS_L = {t: [(_RES_IDX[r], a) for r, a in m['cons'].items()] for t, m in MODUL
 EPS = 1e-6
 _CACHE_CAP = 200_000
 
-# Score tiers (lower=better): infeasible ranks above below-target ranks above on-target.
 INFEASIBLE_PEN = 1e12
 DEFICIT_W = 1e3
 BELOW_TARGET_PEN = 1e8
@@ -70,7 +69,6 @@ def _neighbors_list(w, h):
     return nb
 
 
-# Run state (board + config + per-run score cache) threaded explicitly, not via globals.
 class Ctx:
     __slots__ = ('w', 'h', 'n', 'nb', 'corners', 'objective', 'mult',
                  'max_level', 'uncap', 'cache')
@@ -173,7 +171,6 @@ def cell_bonuses(ctx, grid):
     return out
 
 
-# Lean allocation-free copy of evaluate() for the hot path; --selftest asserts they agree.
 def _fast_eval(ctx, grid):
     ovr_adj, same_adj = _neighbor_bonuses(ctx, grid)
     corners = ctx.corners
@@ -364,7 +361,6 @@ def _cell_misplaced(ctx, cell, i):
     return 1 if (cell and _CORNER_ONLY[cell[0]] and i not in ctx.corners) else 0
 
 
-# Best option for cell i, scored incrementally: only i + its neighbours change vs a cached background.
 def _scan_cell(ctx, g, i, target):
     S = [i] + ctx.nb[i]
     ev0 = evaluate(ctx, g)
@@ -726,7 +722,7 @@ def _cpsat_optimize(ctx, target, time_limit, hint=None, stop_event=None):
         from ortools.sat.python import cp_model
     except Exception:
         return None
-    SO = 1000; SS = 1000    # fixed-point scales (output, overclock strength); CP-SAT is integer-only
+    SO = 1000; SS = 1000
     N = ctx.n; nb = ctx.nb; corners = ctx.corners
     PLACE = ['PWR', 'CRW', 'RAM', 'DB', 'OVR', 'SAT']
     Lmax = max(ctx.type_max(t) for t in PLACE)
@@ -841,8 +837,6 @@ def _worker(p):
 
 
 def optimize_parallel(ctx, cfg, target, restarts, iters):
-    # Frozen onefile exe: Python multiprocessing would re-extract the bundle per worker,
-    # so run the warm-start single-process. CP-SAT still uses all cores via its own threads.
     if getattr(sys, 'frozen', False):
         return optimize(ctx, target, restarts=min(restarts, 8), iters=iters)
     try:
@@ -872,9 +866,6 @@ def optimize_parallel(ctx, cfg, target, restarts, iters):
         return optimize(ctx, target, restarts=restarts, iters=iters)
 
 
-# Warm-start heuristic, then (if OR-Tools is present) the exact CP-SAT solve, then spend
-# any remaining Time Limit on more heuristic passes -- so the budget is used either way.
-# stop_event ends early with the best-so-far.
 def solve_engine(ctx, cfg, target, time_limit, prior=None, stop_event=None):
     import time as _time
     start = _time.time()
@@ -921,8 +912,6 @@ def _load_state():
         pass
 
 
-# Script mode rewrites this file's own `name = ...` line; frozen (exe) can't, so it
-# writes a sidecar state file next to the exe instead.
 def _rewrite_self(name, value):
     try:
         import re
@@ -963,7 +952,6 @@ def _load_champion(key):
     return _CHAMPIONS.get(key)
 
 
-# Reuse the best champion still buildable/valid under current settings, not just the exact-key one.
 def _best_prior(ctx, target):
     best = None; best_m = None
     for grid in _CHAMPIONS.values():
@@ -1155,7 +1143,6 @@ def run_gui():
     root.mainloop()
 
 
-# Re-exec under pythonw.exe so launching the .py shows no console window.
 def _relaunch_windowless():
     if os.name != 'nt':
         return False
