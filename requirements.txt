@@ -1,3 +1,0 @@
-# Optional but recommended: the exact CP-SAT solver.
-# Without it the program falls back to a heuristic.
-ortools
