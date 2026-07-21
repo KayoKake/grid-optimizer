@@ -131,7 +131,7 @@ def evaluate(ctx, grid):
             misplaced += 1
             base_equiv[t] = base_equiv.get(t, 0.0) + LVL_WEIGHT ** (lvl - 1)
             continue
-        out_mult  = LVL_OUT ** (lvl - 1)
+        out_mult  = 1 + (LVL_OUT - 1) * (lvl - 1)
         cons_mult = out_mult if SCALE_CONS_WITH_LEVEL else 1.0
         boost = 1.0 + ovr_adj[i] + 0.10 * same_adj[i]
 
@@ -187,7 +187,7 @@ def _fast_eval(ctx, grid):
         if _CORNER_ONLY[t] and i not in corners:
             misplaced += 1
             continue
-        out_mult = LVL_OUT ** (lvl - 1)
+        out_mult = 1 + (LVL_OUT - 1) * (lvl - 1)
         cons_mult = out_mult if SCALE_CONS_WITH_LEVEL else 1.0
         boost = 1.0 + ovr_adj[i] + 0.10 * same_adj[i]
         for ri, amt in _PROD_L[t]:
@@ -329,7 +329,7 @@ def _cell_contrib(ctx, g, n):
             ovr += ovr_strength(o[1])
         if o[0] == t:
             same += 1
-    out_mult  = LVL_OUT ** (lvl - 1)
+    out_mult  = 1 + (LVL_OUT - 1) * (lvl - 1)
     cons_mult = out_mult if SCALE_CONS_WITH_LEVEL else 1.0
     boost = 1.0 + ovr + 0.10 * same
     for r, amt in MODULES[t]['prod'].items():
@@ -726,7 +726,7 @@ def _cpsat_optimize(ctx, target, time_limit, hint=None, stop_event=None):
     N = ctx.n; nb = ctx.nb; corners = ctx.corners
     PLACE = ['PWR', 'CRW', 'RAM', 'DB', 'OVR', 'SAT']
     Lmax = max(ctx.type_max(t) for t in PLACE)
-    OUT = [round(SO * (LVL_OUT ** (l - 1))) for l in range(1, Lmax + 1)]
+    OUT = [round(SO * (1 + (LVL_OUT - 1) * (l - 1))) for l in range(1, Lmax + 1)]
     OVRSTR = [round(SS * ovr_strength(l)) for l in range(1, Lmax + 1)]
     RES = ['power', 'data', 'memory']
     mdl = cp_model.CpModel()
